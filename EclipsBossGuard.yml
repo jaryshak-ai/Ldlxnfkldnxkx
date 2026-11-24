@@ -1,0 +1,598 @@
+name: Build EclipsBossGuard
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Create project files
+        run: |
+          mkdir -p guard/src/main/java/ru/eclips/bossguard guard/src/main/resources
+          cat > guard/pom.xml <<'EOF_POM'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project xmlns="http://maven.apache.org/POM/4.0.0"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+            <modelVersion>4.0.0</modelVersion>
+            <groupId>ru.eclips</groupId>
+            <artifactId>eclips-boss-guard</artifactId>
+            <version>1.0.0</version>
+            <packaging>jar</packaging>
+            <properties>
+              <maven.compiler.source>17</maven.compiler.source>
+              <maven.compiler.target>17</maven.compiler.target>
+              <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+            </properties>
+            <repositories>
+              <repository>
+                <id>opencollab-repo-release</id>
+                <url>https://repo.opencollab.dev/maven-releases/</url>
+              </repository>
+              <repository>
+                <id>opencollab-repo-snapshot</id>
+                <url>https://repo.opencollab.dev/maven-snapshots/</url>
+                <releases><enabled>false</enabled></releases>
+                <snapshots><enabled>true</enabled></snapshots>
+              </repository>
+              <repository>
+                <id>okaeri-releases</id>
+                <url>https://repo.okaeri.cloud/releases</url>
+              </repository>
+              <repository>
+                <id>porklib-maven</id>
+                <url>https://maven.daporkchop.net/</url>
+              </repository>
+            </repositories>
+            <dependencies>
+              <dependency>
+                <groupId>com.nukkit-mot</groupId>
+                <artifactId>nukkit-mot</artifactId>
+                <version>1.26.40-R1</version>
+                <scope>provided</scope>
+              </dependency>
+            </dependencies>
+            <build>
+              <finalName>EclipsBossGuard</finalName>
+              <plugins>
+                <plugin>
+                  <groupId>org.apache.maven.plugins</groupId>
+                  <artifactId>maven-compiler-plugin</artifactId>
+                  <version>3.11.0</version>
+                  <configuration>
+                    <source>17</source>
+                    <target>17</target>
+                    <encoding>UTF-8</encoding>
+                  </configuration>
+                </plugin>
+              </plugins>
+            </build>
+          </project>
+          EOF_POM
+          cat > guard/src/main/resources/plugin.yml <<'EOF_PLUGIN'
+          name: EclipsBossGuard
+          main: ru.eclips.bossguard.EclipsBossGuard
+          version: 1.0.0
+          api: ["1.0.0"]
+          author: Eclips
+          description: Надстройка над EclipsBoss - проигрыш вместо смерти, отсчёт до босса, зачистка мира
+          depend: [EclipsBoss]
+          softdepend: [LuckPerms]
+
+          permissions:
+            eclips.bossguard.bypass:
+              description: Не выкидывать из мира босса, если не участник ивента
+              default: op
+          EOF_PLUGIN
+          cat > guard/src/main/resources/config.yml <<'EOF_CONFIG'
+          # EclipsBossGuard: надстройка над EclipsBoss
+
+          # Куда отправлять (спавн). Берётся точка спавна этого мира.
+          lobby:
+            world: "mw8"
+            use-world-spawn: true
+            # Используется, только если use-world-spawn: false
+            x: 0.5
+            y: 70.0
+            z: 0.5
+
+          # 1) Смерть в мире босса заменена на проигрыш. Тотем бессмертия не трогаем.
+          lose:
+            enabled: true
+            title: "§c§lВы проиграли"
+            subtitle: "§7Вы возвращены на спавн"
+            message: "§c§lВы проиграли!"
+            # Вернуть полное здоровье (иначе игрок окажется на спавне почти мёртвым)
+            heal: true
+
+          # 3) Раз в секунду отправлять на спавн всех, кто в мире босса не участвует в ивенте
+          #    (кроме операторов и тех, у кого есть право eclips.bossguard.bypass)
+          sweep:
+            enabled: true
+            interval-ticks: 20
+            # После конца ивента участники ещё столько секунд могут забрать дроп
+            grace-after-event-seconds: 60
+            message: "§6[Eclips] §cВ этом мире могут находиться только участники босс-ивента."
+
+          # Игрок вышел из игры в мире босса -> при выходе переносится на спавн
+          quit-teleport: true
+
+          # 2) Красная полоска с отсчётом от открытия ивента до появления босса
+          countdown-bar:
+            enabled: true
+            # all = всем игрокам онлайн, world = только тем, кто в мире босса
+            audience: "all"
+            text: "{boss} §r§c- появление через §f§l{time}"
+          EOF_CONFIG
+          cat > guard/src/main/java/ru/eclips/bossguard/EclipsBossGuard.java <<'EOF_JAVA'
+          package ru.eclips.bossguard;
+
+          import cn.nukkit.Player;
+          import cn.nukkit.event.EventHandler;
+          import cn.nukkit.event.EventPriority;
+          import cn.nukkit.event.Listener;
+          import cn.nukkit.event.entity.EntityDamageEvent;
+          import cn.nukkit.event.player.PlayerQuitEvent;
+          import cn.nukkit.event.player.PlayerTeleportEvent;
+          import cn.nukkit.item.Item;
+          import cn.nukkit.level.Level;
+          import cn.nukkit.level.Position;
+          import cn.nukkit.plugin.Plugin;
+          import cn.nukkit.plugin.PluginBase;
+          import cn.nukkit.utils.Config;
+
+          import java.lang.reflect.Field;
+          import java.lang.reflect.Method;
+          import java.util.ArrayList;
+          import java.util.HashMap;
+          import java.util.HashSet;
+          import java.util.Map;
+          import java.util.Set;
+          import java.util.UUID;
+          import java.util.concurrent.ConcurrentHashMap;
+
+          /**
+           * EclipsBossGuard: надстройка над EclipsBoss (Лорд Тьмы).
+           * 1) в мире босса смерть заменена на "Вы проиграли" + телепорт на спавн (тотем не трогаем);
+           * 2) красная полоска с отсчётом от открытия ивента до появления босса;
+           * 3) не-участники в мире босса и вышедшие из игры отправляются на спавн.
+           */
+          public class EclipsBossGuard extends PluginBase implements Listener {
+
+              private static final String BYPASS = "eclips.bossguard.bypass";
+
+              private Plugin boss;
+              private Field phaseField;
+              private Field startField;
+
+              private final Set<UUID> participants = ConcurrentHashMap.newKeySet();
+              private final Set<UUID> losing = ConcurrentHashMap.newKeySet();
+              private final Map<UUID, Bar> bars = new HashMap<>();
+
+              private long lastActiveMs = 0L;
+              private boolean barFailed = false;
+              private boolean lobbyWarned = false;
+              private boolean sweepWarned = false;
+
+              private static final class Bar {
+                  Player player;
+                  Object bar;
+                  long id;
+              }
+
+              @Override
+              public void onEnable() {
+                  saveDefaultConfig();
+                  boss = getServer().getPluginManager().getPlugin("EclipsBoss");
+                  if (!(boss instanceof PluginBase)) {
+                      getLogger().error("Плагин EclipsBoss не найден, EclipsBossGuard отключён");
+                      getServer().getPluginManager().disablePlugin(this);
+                      return;
+                  }
+                  try {
+                      phaseField = boss.getClass().getDeclaredField("phase");
+                      phaseField.setAccessible(true);
+                      startField = boss.getClass().getDeclaredField("startMs");
+                      startField.setAccessible(true);
+                  } catch (Throwable t) {
+                      getLogger().error("Не удалось прочитать состояние EclipsBoss (версия плагина изменилась?): " + t);
+                      getServer().getPluginManager().disablePlugin(this);
+                      return;
+                  }
+                  getServer().getPluginManager().registerEvents(this, this);
+                  int interval = Math.max(5, getConfig().getInt("sweep.interval-ticks", 20));
+                  getServer().getScheduler().scheduleRepeatingTask(this, this::tick, interval);
+                  getLogger().info("EclipsBossGuard включён");
+              }
+
+              @Override
+              public void onDisable() {
+                  clearBars();
+              }
+
+              // ---------------------------------------------------------------- состояние босса
+
+              private Config bossCfg() {
+                  return ((PluginBase) boss).getConfig();
+              }
+
+              private int readPhase() {
+                  try {
+                      return phaseField.getInt(boss);
+                  } catch (Throwable t) {
+                      return 0;
+                  }
+              }
+
+              private long readStart() {
+                  try {
+                      return startField.getLong(boss);
+                  } catch (Throwable t) {
+                      return 0L;
+                  }
+              }
+
+              private Level bossLevel() {
+                  return findLevel(bossCfg().getString("spawn.world", "world"));
+              }
+
+              private Level findLevel(String name) {
+                  if (name == null || name.isEmpty()) return null;
+                  Level l = getServer().getLevelByName(name);
+                  if (l != null) return l;
+                  try {
+                      for (Level x : getServer().getLevels().values()) {
+                          if (name.equalsIgnoreCase(x.getFolderName()) || name.equalsIgnoreCase(x.getName())) return x;
+                      }
+                  } catch (Throwable ignored) {
+                  }
+                  return null;
+              }
+
+              private boolean inBossWorld(Player p) {
+                  Level bl = bossLevel();
+                  return bl != null && p.getLevel() == bl;
+              }
+
+              private boolean isBypass(Player p) {
+                  return p.isOp() || p.hasPermission(BYPASS);
+              }
+
+              private boolean eventActive() {
+                  if (readPhase() != 0) return true;
+                  long grace = Math.max(0, getConfig().getInt("sweep.grace-after-event-seconds", 60)) * 1000L;
+                  return lastActiveMs > 0 && System.currentTimeMillis() - lastActiveMs <= grace;
+              }
+
+              // ---------------------------------------------------------------- спавн
+
+              private Position lobbyPosition() {
+                  Config c = getConfig();
+                  Level l = findLevel(c.getString("lobby.world", "mw8"));
+                  if (l == null) {
+                      if (!lobbyWarned) {
+                          lobbyWarned = true;
+                          getLogger().warning("Мир спавна '" + c.getString("lobby.world", "mw8")
+                                  + "' не найден, использую мир по умолчанию");
+                      }
+                      l = getServer().getDefaultLevel();
+                  }
+                  if (l == null) return null;
+                  if (c.getBoolean("lobby.use-world-spawn", true)) {
+                      return l.getSafeSpawn();
+                  }
+                  return new Position(c.getDouble("lobby.x", 0.5), c.getDouble("lobby.y", 70.0), c.getDouble("lobby.z", 0.5), l);
+              }
+
+              private boolean toLobby(Player p) {
+                  try {
+                      Position pos = lobbyPosition();
+                      if (pos == null) return false;
+                      return p.teleport(pos);
+                  } catch (Throwable t) {
+                      return false;
+                  }
+              }
+
+              // ---------------------------------------------------------------- 1) смерть -> "Вы проиграли"
+
+              @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+              public void onDamage(EntityDamageEvent e) {
+                  if (!getConfig().getBoolean("lose.enabled", true)) return;
+                  if (!(e.getEntity() instanceof Player)) return;
+                  Player p = (Player) e.getEntity();
+                  if (!inBossWorld(p)) return;
+                  if (p.isCreative() || p.isSpectator()) return;
+                  if (p.getHealth() - e.getFinalDamage() >= 1f) return; // удар не смертельный
+
+                  String cause = e.getCause() == null ? "" : e.getCause().name();
+                  boolean totemUseless = cause.equals("VOID") || cause.equals("SUICIDE");
+                  if (!totemUseless && hasTotem(p)) return; // тотем сработает сам, не мешаем
+
+                  e.setCancelled(true);
+                  lose(p);
+              }
+
+              private void lose(Player p) {
+                  final UUID id = p.getUniqueId();
+                  if (!losing.add(id)) return; // уже проигрывает в этот тик
+                  Config c = getConfig();
+                  participants.remove(id);
+                  if (c.getBoolean("lose.heal", true)) {
+                      try {
+                          p.setHealth(p.getMaxHealth());
+                      } catch (Throwable ignored) {
+                      }
+                  }
+                  try {
+                      p.extinguish();
+                  } catch (Throwable ignored) {
+                  }
+                  try {
+                      p.removeAllEffects();
+                  } catch (Throwable ignored) {
+                  }
+                  p.sendMessage(c.getString("lose.message", "§c§lВы проиграли!"));
+                  try {
+                      p.sendTitle(c.getString("lose.title", "§c§lВы проиграли"), c.getString("lose.subtitle", "§7Вы возвращены на спавн"));
+                  } catch (Throwable ignored) {
+                  }
+                  getServer().getScheduler().scheduleDelayedTask(this, () -> {
+                      try {
+                          toLobby(p);
+                      } finally {
+                          losing.remove(id);
+                      }
+                  }, 1);
+              }
+
+              private boolean hasTotem(Player p) {
+                  try {
+                      if (isTotem(p.getInventory().getItemInHand())) return true;
+                  } catch (Throwable ignored) {
+                  }
+                  try {
+                      Object off = p.getClass().getMethod("getOffhandInventory").invoke(p);
+                      Object it = off.getClass().getMethod("getItem", int.class).invoke(off, 0);
+                      if (it instanceof Item && isTotem((Item) it)) return true;
+                  } catch (Throwable ignored) {
+                  }
+                  return false;
+              }
+
+              private boolean isTotem(Item item) {
+                  if (item == null) return false;
+                  try {
+                      if (item.getId() == 450) return true; // totem_of_undying
+                  } catch (Throwable ignored) {
+                  }
+                  try {
+                      String n = item.getName();
+                      if (n != null && n.toLowerCase().contains("totem")) return true;
+                  } catch (Throwable ignored) {
+                  }
+                  try {
+                      Object ns = item.getClass().getMethod("getNamespaceId").invoke(item);
+                      if (ns != null && ns.toString().toLowerCase().contains("totem")) return true;
+                  } catch (Throwable ignored) {
+                  }
+                  return false;
+              }
+
+              // ---------------------------------------------------------------- 3) участники / выход / зачистка
+
+              @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+              public void onTeleport(PlayerTeleportEvent e) {
+                  try {
+                      Level bl = bossLevel();
+                      if (bl == null) return;
+                      Position to = e.getTo();
+                      Player p = e.getPlayer();
+                      if (to == null || to.getLevel() != bl || p.getLevel() == bl) return;
+                      if (!eventActive()) return;
+                      // участник = тот, кого /boss телепортировал к боссу (рядом с точкой появления)
+                      Config bc = bossCfg();
+                      double dx = to.x - bc.getDouble("spawn.x", 0.5);
+                      double dz = to.z - bc.getDouble("spawn.z", 0.5);
+                      double max = bc.getDouble("event.teleport-max", 15.0) + 10.0;
+                      if (dx * dx + dz * dz <= max * max) participants.add(p.getUniqueId());
+                  } catch (Throwable ignored) {
+                  }
+              }
+
+              @EventHandler(priority = EventPriority.MONITOR)
+              public void onQuit(PlayerQuitEvent e) {
+                  Player p = e.getPlayer();
+                  UUID id = p.getUniqueId();
+                  participants.remove(id);
+                  losing.remove(id);
+                  Bar b = bars.remove(id);
+                  if (b != null) destroyBar(b);
+                  if (!getConfig().getBoolean("quit-teleport", true)) return;
+                  try {
+                      if (!isBypass(p) && inBossWorld(p)) toLobby(p);
+                  } catch (Throwable ignored) {
+                  }
+              }
+
+              private void tick() {
+                  try {
+                      int phase = readPhase();
+                      long now = System.currentTimeMillis();
+                      if (phase != 0) lastActiveMs = now;
+                      boolean active = eventActive();
+                      if (!active && !participants.isEmpty()) participants.clear();
+                      updateCountdown(phase, now);
+                      sweep(active);
+                  } catch (Throwable t) {
+                      getLogger().error("Ошибка в тике: " + t);
+                  }
+              }
+
+              private void sweep(boolean active) {
+                  Config c = getConfig();
+                  if (!c.getBoolean("sweep.enabled", true)) return;
+                  Level bl = bossLevel();
+                  if (bl == null) return;
+                  Level lobby = findLevel(c.getString("lobby.world", "mw8"));
+                  Level def = getServer().getDefaultLevel();
+                  if (bl == lobby || bl == def) {
+                      if (!sweepWarned) {
+                          sweepWarned = true;
+                          getLogger().warning("Мир босса (" + bl.getFolderName()
+                                  + ") совпадает с миром спавна или главным миром сервера: зачистка не-участников отключена");
+                      }
+                      return;
+                  }
+                  String msg = c.getString("sweep.message", "§6[Eclips] §cВ этом мире могут находиться только участники босс-ивента.");
+                  for (Player p : new ArrayList<>(bl.getPlayers().values())) {
+                      try {
+                          UUID id = p.getUniqueId();
+                          if (!p.isOnline() || !p.isAlive()) continue;
+                          if (isBypass(p)) continue;
+                          if (losing.contains(id)) continue;
+                          if (active && participants.contains(id)) continue;
+                          if (toLobby(p)) p.sendMessage(msg);
+                      } catch (Throwable ignored) {
+                      }
+                  }
+              }
+
+              // ---------------------------------------------------------------- 2) красная полоска с отсчётом
+
+              private void updateCountdown(int phase, long now) {
+                  Config c = getConfig();
+                  long delay = bossCfg().getInt("event.spawn-delay-minutes", 5) * 60000L;
+                  if (!c.getBoolean("countdown-bar.enabled", true) || phase != 1 || delay <= 0) {
+                      clearBars();
+                      return;
+                  }
+                  long left = Math.max(0L, readStart() + delay - now);
+                  float pct = Math.max(0f, Math.min(100f, left * 100f / delay));
+                  long secs = (left + 999L) / 1000L;
+                  String time = (secs / 60) + ":" + (secs % 60 < 10 ? "0" : "") + (secs % 60);
+                  String text = c.getString("countdown-bar.text", "{boss} §r§c- появление через §f§l{time}")
+                          .replace("{boss}", bossCfg().getString("boss.name", "§4§lЛорд Тьмы"))
+                          .replace("{time}", time);
+
+                  java.util.Collection<Player> targets;
+                  if ("world".equalsIgnoreCase(c.getString("countdown-bar.audience", "all"))) {
+                      Level bl = bossLevel();
+                      targets = bl == null ? new ArrayList<Player>() : new ArrayList<>(bl.getPlayers().values());
+                  } else {
+                      targets = new ArrayList<>(getServer().getOnlinePlayers().values());
+                  }
+                  Set<UUID> keep = new HashSet<>();
+                  for (Player p : targets) {
+                      if (!p.isOnline()) continue;
+                      keep.add(p.getUniqueId());
+                      showBar(p, text, pct);
+                  }
+                  java.util.Iterator<Map.Entry<UUID, Bar>> it = bars.entrySet().iterator();
+                  while (it.hasNext()) {
+                      Map.Entry<UUID, Bar> en = it.next();
+                      if (!keep.contains(en.getKey())) {
+                          destroyBar(en.getValue());
+                          it.remove();
+                      }
+                  }
+              }
+
+              private void showBar(Player p, String text, float pct) {
+                  if (barFailed) {
+                      p.sendPopup(text);
+                      return;
+                  }
+                  try {
+                      Bar b = bars.get(p.getUniqueId());
+                      if (b == null) {
+                          Class<?> bbClass = Class.forName("cn.nukkit.utils.DummyBossBar");
+                          Class<?> builderClass = Class.forName("cn.nukkit.utils.DummyBossBar$Builder");
+                          Object builder = builderClass.getConstructor(Player.class).newInstance(p);
+                          builderClass.getMethod("text", String.class).invoke(builder, text);
+                          builderClass.getMethod("length", float.class).invoke(builder, pct);
+                          tryRed(builder, "color");
+                          Object bar = builderClass.getMethod("build").invoke(builder);
+                          Object id = Player.class.getMethod("createBossBar", bbClass).invoke(p, bar);
+                          b = new Bar();
+                          b.player = p;
+                          b.bar = bar;
+                          b.id = id instanceof Number ? ((Number) id).longValue() : 0L;
+                          bars.put(p.getUniqueId(), b);
+                      } else {
+                          b.bar.getClass().getMethod("setText", String.class).invoke(b.bar, text);
+                          b.bar.getClass().getMethod("setLength", float.class).invoke(b.bar, pct);
+                      }
+                  } catch (Throwable t) {
+                      barFailed = true;
+                      getLogger().error("Не удалось создать полоску босса, использую подсказку над хотбаром: " + t
+                              + (t.getCause() != null ? " / " + t.getCause() : ""));
+                      p.sendPopup(text);
+                  }
+              }
+
+              /** Делает полоску красной разными способами, как это принято в разных версиях ядра. */
+              private void tryRed(Object builder, String name) throws Exception {
+                  for (Method m : builder.getClass().getMethods()) {
+                      if (!m.getName().equals(name)) continue;
+                      Class<?>[] pt = m.getParameterTypes();
+                      if (pt.length == 3 && pt[0] == float.class) {
+                          m.invoke(builder, 1f, 0f, 0f);
+                          return;
+                      }
+                      if (pt.length == 3 && pt[0] == int.class) {
+                          m.invoke(builder, 255, 0, 0);
+                          return;
+                      }
+                      if (pt.length == 1 && pt[0].isEnum()) {
+                          for (Object o : pt[0].getEnumConstants()) {
+                              if (o.toString().equalsIgnoreCase("RED")) {
+                                  m.invoke(builder, o);
+                                  return;
+                              }
+                          }
+                      }
+                      if (pt.length == 1) {
+                          try {
+                              Object col = pt[0].getConstructor(int.class, int.class, int.class).newInstance(255, 0, 0);
+                              m.invoke(builder, col);
+                              return;
+                          } catch (Throwable ignored) {
+                          }
+                      }
+                  }
+              }
+
+              private void destroyBar(Bar b) {
+                  try {
+                      if (b.player != null && b.player.isOnline()) {
+                          Player.class.getMethod("removeBossBar", long.class).invoke(b.player, b.id);
+                      }
+                  } catch (Throwable ignored) {
+                  }
+              }
+
+              private void clearBars() {
+                  if (bars.isEmpty()) return;
+                  for (Bar b : bars.values()) destroyBar(b);
+                  bars.clear();
+              }
+          }
+          EOF_JAVA
+
+      - name: Build
+        run: mvn -B -f guard/pom.xml package
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EclipsBossGuard
+          path: guard/target/EclipsBossGuard.jar
